@@ -17,13 +17,20 @@ from datetime import datetime
 import json
 import subprocess
 import tempfile
+from typing import Optional, Tuple  # noqa: H301
 
+
+import eventlet
 from oslo_config import cfg
 from oslo_log import log as logging
+import rados
+import rbd
 
 from cinder.backup import driver
 from cinder import exception
 from cinder.message import message_field
+import cinder.volume.drivers.rbd as rbd_driver
+
 LOG = logging.getLogger(__name__)
 CONF = cfg.CONF
 service_opts = [
@@ -40,9 +47,11 @@ service_opts = [
     cfg.StrOpt('benji_cinder_snapshot_prefix', default='snapshot-',
                help='Rbd prefix for cinder snaphot   id'),
     cfg.StrOpt('benji_snapshot_prefix', default='benjibackup-',
-               help='Rbd prefix for cinder snaphot   id'),
+               help='Rbd prefix for cinder snaphot id'),
     cfg.StrOpt('benji_premade_snapshot_prefix', default='benjibackup_premade-',
-               help='Rbd prefix for cinder snaphot   id'),
+               help='Rbd prefix for premade cinder snaphot id'),
+    cfg.StrOpt('benji_ceph_conf', default='/etc/ceph/ceph.conf',
+               help='Path to ceph conf')
 ]
 CONF.register_opts(service_opts)
 
@@ -55,33 +64,41 @@ class BenjiBackupDriver(driver.BackupDriver):
             context.message_action = message_field.Action.BACKUP_CREATE
         super().__init__(context)
 
-    def _rename_snap(self, volume_id, premade_snap, snapshot):
-        premade_snappath = self._get_snap_path(volume_id,
-                                               premade_snap,
-                                               include_io_scheme=False)
+    def _connect_to_rados(self,
+                          pool: Optional[str] = None) -> Tuple['rados.Rados',
+                                                               'rados.Ioctx']:
+        """Establish connection to the backup Ceph cluster."""
+        client = eventlet.tpool.Proxy(rados.Rados(
+                                      rados_id=CONF.benji_ceph_user,
+                                      conffile=CONF.benji_ceph_conf
+                                      ))
+        try:
+            client.connect()
+            pool_to_open = pool or CONF.benji_cinder_volume_pool
+            ioctx = client.open_ioctx(pool_to_open)
+            return client, ioctx
+        except rados.Error:
+            # shutdown cannot raise an exception
+            client.shutdown()
+            raise
 
-        snap_path = self._get_snap_path(volume_id,
-                                        snapshot,
-                                        include_io_scheme=False)
+    @staticmethod
+    def _disconnect_from_rados(client: 'rados.Rados',
+                               ioctx: 'rados.Ioctx') -> None:
+        """Terminate connection with the backup Ceph cluster."""
+        # closing an ioctx cannot raise an exception
+        ioctx.close()
+        client.shutdown()
+
+    def _rename_snap(self, source_rbd, premade_snap, snapshot):
         LOG.info("renaming '%(premade_snap)s' to '%(snap)s'", {
-            'premade_snap': premade_snappath,
-            'snap': snap_path,
-        })
-        subprocess.run(['rbd', 'snap', 'rename',
-                        premade_snappath,
-                        snap_path,
-                        '--id', CONF.benji_ceph_user])
+            'premade_snap': premade_snap,
+            'snap': snapshot})
+        source_rbd.rename_snap(premade_snap, snapshot)
 
-    def _get_snap_list(self, volume_id, snap_prefix):
-        snaps = subprocess.run(['rbd', 'snap', 'ls', '--format=json',
-                                '{0}/{1}{2}'.format(
-                                    CONF.benji_cinder_volume_pool,
-                                    CONF.benji_cinder_volume_prefix,
-                                    volume_id),
-                                '--id',
-                                CONF.benji_ceph_user],
-                               capture_output=True)
-        snapshotlist = json.loads(snaps.stdout)
+    def _get_snap_list(self, source_rbd: rbd.Image, snap_prefix):
+
+        snapshotlist = source_rbd.list_snaps()
         benji_snaps = [
             snapshot["name"] for snapshot in snapshotlist
             if snapshot["name"].startswith(snap_prefix)
@@ -114,6 +131,12 @@ class BenjiBackupDriver(driver.BackupDriver):
         worry about that..
         """
         LOG.debug("'%(backup)s'", {'backup': backup})
+        client = eventlet.tpool.Proxy(rbd_driver.RADOSClient(self,
+                                      CONF.benji_cinder_volume_pool))
+        source_rbd = eventlet.tpool.Proxy(rbd.Image(
+            client.ioctx,
+            f'{CONF.benji_cinder_volume_prefix}{backup.volume_id}',
+            read_only=False))
         if backup["snapshot_id"] is not None:
             snapshot = "{0}{1}".format(CONF.benji_snaphost_prefix,
                                        backup["snapshot_id"])
@@ -133,20 +156,15 @@ class BenjiBackupDriver(driver.BackupDriver):
             snapshot = now.strftime(CONF.benji_snapshot_prefix +
                                     '%Y-%m-%dT%H:%M:%SZ')
             premade_snaps = self._get_snap_list(
-                backup.volume_id,
+                source_rbd,
                 CONF.benji_premade_snapshot_prefix)
             LOG.debug(premade_snaps)
             if len(premade_snaps) > 0:
-                self._rename_snap(backup.volume_id,
+                self._rename_snap(source_rbd,
                                   premade_snaps[-1],
                                   snapshot)
             else:
-                subprocess.run(['rbd', 'snap', 'create', '--no-progress',
-                                self._get_snap_path(
-                                    backup.volume_id,
-                                    snapshot,
-                                    include_io_scheme=False),
-                                '--id', CONF.benji_ceph_user])
+                source_rbd.create_snap(snapshot)
 
             result = subprocess.run(['rbd', 'diff', '--whole-object',
                                      '--format=json',
@@ -173,21 +191,16 @@ class BenjiBackupDriver(driver.BackupDriver):
                           {'volume_id': backup.volume_id,
                            'parent_id': backup.parent.volume_id})
             else:
-                benji_snaps_id_sorted = self._get_snap_list(
-                    backup.volume_id,
+                benji_snaps_unsorted = self._get_snap_list(
+                    source_rbd,
                     CONF.benji_snapshot_prefix)
                 # sort the list by  name without the prefix, i.e by date.
-                benji_snaps = sorted(benji_snaps_id_sorted,
+                benji_snaps = sorted(benji_snaps_unsorted,
                                      key=lambda x: x.split(
                                          CONF.benji_snapshot_prefix)[1])
                 LOG.debug(benji_snaps)
                 for delete_snapname in benji_snaps[:-1]:
-                    subprocess.run(['rbd', 'snap', 'rm',
-                                    self._get_snap_path(
-                                        backup.volume_id,
-                                        delete_snapname,
-                                        include_io_scheme=False),
-                                    '--id', CONF.benji_ceph_user])
+                    source_rbd.remove_snap(delete_snapname)
                 last_snapshot = benji_snaps[-1]
                 result = subprocess.run([
                     CONF.benji_cli_path, '--machine-output', 'ls',
@@ -208,21 +221,15 @@ class BenjiBackupDriver(driver.BackupDriver):
                 snapshot = now.strftime(CONF.benji_snapshot_prefix +
                                         '%Y-%m-%dT%H:%M:%SZ')
                 premade_snaps = self._get_snap_list(
-                    backup.volume_id,
+                    source_rbd,
                     CONF.benji_premade_snapshot_prefix)
                 LOG.debug(premade_snaps)
                 if len(premade_snaps) > 0:
-                    self._rename_snap(backup.volume_id,
+                    self._rename_snap(source_rbd,
                                       premade_snaps[-1],
                                       snapshot)
                 else:
-                    LOG.debug(subprocess.run(['rbd', 'snap', 'create',
-                                              '--no-progress',
-                                              self._get_snap_path(
-                                                  backup.volume_id,
-                                                  snapshot,
-                                                  include_io_scheme=False),
-                                              '--id', CONF.benji_ceph_user]))
+                    source_rbd.create_snap(snapshot)
                 hintscmd = subprocess.run(['rbd', 'diff', '--whole-object',
                                            '--format=json', '--from-snap',
                                            last_snapshot, self._get_snap_path(
@@ -236,11 +243,7 @@ class BenjiBackupDriver(driver.BackupDriver):
                 hints_file.flush()
                 LOG.debug(hintscmd.stdout)
                 LOG.debug(hintscmd.stderr)
-                subprocess.run(['rbd', 'snap', 'rm', '--no-progress',
-                                self._get_snap_path(backup.volume_id,
-                                                    last_snapshot,
-                                                    include_io_scheme=False),
-                                '--id', CONF.benji_ceph_user])
+                source_rbd.remove_snap(last_snapshot)
                 LOG.debug(str(subprocess.run([
                     CONF.benji_cli_path, 'backup',
                     '--snapshot', snapshot,

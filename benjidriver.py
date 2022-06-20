@@ -14,11 +14,13 @@
 #    under the License.
 
 from datetime import datetime
-import json
-import subprocess
-import tempfile
 from typing import Optional, Tuple  # noqa: H301
 
+from benji.benji import Benji
+from benji.benji import VersionUid
+import benji.config as benji_config
+from benji.io.factory import IOFactory
+from benji.storage.factory import StorageFactory
 import eventlet
 from oslo_config import cfg
 from oslo_log import log as logging
@@ -30,8 +32,21 @@ from cinder import exception
 import cinder.volume.drivers.rbd as rbd_driver
 
 
-LOG = logging.getLogger(__name__)
-CONF = cfg.CONF
+def setup_logging():
+
+    extra_log_level_defaults = [
+        'dogpile=INFO',
+        'routes=INFO',
+        'benji=INFO'
+    ]
+
+    logging.set_defaults(
+        default_log_levels=logging.get_default_log_levels() +
+        extra_log_level_defaults)
+
+    logging.setup(CONF, "cinder-backup")
+
+
 service_opts = [
     cfg.StrOpt('benji_cli_path', default='/opt/benji/bin/benji',
                help='Path to benji cli binary (in a venv)'),
@@ -44,23 +59,28 @@ service_opts = [
     cfg.StrOpt('benji_premade_snapshot_prefix', default='benjibackup_premade-',
                help='Rbd prefix for premade cinder snaphot id'),
 ]
+CONF = cfg.CONF
 CONF.register_opts(service_opts)
+setup_logging()
+LOG = logging.getLogger(__name__)
 
 
 class BenjiBackupDriver(driver.BackupDriver):
+
     """Provides backup, restore and delete using benji-backup system."""
 
-    def __init__(self, context):
-        LOG.debug(context)
+    def __init__(self, context, db=None):
         super().__init__(context)
         self.rados = rados
         self.rbd = rbd
         self.diff_list = []
+        bconfig = benji_config.Config()
+        IOFactory.initialize(bconfig)
+        StorageFactory.initialize(bconfig)
+        self.b_backup = Benji(bconfig)
 
     def iterate_cb(self, offset, length, exists):
-        self.diff_list.append({"offset": offset,
-                               "length": length,
-                               "exists": str(exists).lower()})
+        self.diff_list.append((offset, length, exists))
 
     def _connect_to_rados(self,
                           pool: Optional[str] = None) -> Tuple['rados.Rados',
@@ -153,21 +173,15 @@ class BenjiBackupDriver(driver.BackupDriver):
                 for delete_snapname in benji_snaps[:-1]:
                     source_rbd.remove_snap(delete_snapname)
                 last_snapshot = benji_snaps[-1]
-                result = subprocess.run([
-                    CONF.benji_cli_path, '--machine-output', 'ls',
+                versions = self.b_backup.find_versions_with_filter(
                     f'volume == "{backup.volume_id}"\
                            and snapshot == "{last_snapshot}"\
-                           and status == "valid"'],
-                    capture_output=True)
-                versions = json.loads(result.stdout)
-                LOG.debug(result.stderr)
-                LOG.debug(result.stdout)
-                LOG.debug(versions)
-                if len(versions["versions"]) == 0:
+                           and status == "valid"')
+                if len(versions) == 0:
                     raise exception.BackupDriverException(
                         reason = 'latest snapshot is not in ' +
                                  'benji db please fallback to full backup')
-                LOG.debug(versions["versions"][0]["uid"])
+                LOG.debug(versions[0].uid)
                 now = datetime.utcnow()
                 snapshot = now.strftime(CONF.benji_snapshot_prefix +
                                         '%Y-%m-%dT%H:%M:%SZ')
@@ -191,27 +205,18 @@ class BenjiBackupDriver(driver.BackupDriver):
                     source_rbd_snap.diff_iterate(
                         0, source_rbd_snap.size(),
                         last_snapshot, self.iterate_cb, whole_object=True)
-
-                    hints_file = tempfile.NamedTemporaryFile(mode="w+")
-                    json.dump(self.diff_list,
-                              hints_file, separators=(',', ':'))
-                    hints_file.flush()
                     source_rbd.remove_snap(last_snapshot)
-                    LOG.debug(str(subprocess.run([
-                        CONF.benji_cli_path, 'backup',
-                        '--snapshot', snapshot,
-                        '--rbd-hints', hints_file.name,
-                        '--base-version',
-                        versions["versions"][0]["uid"],
-                        '--uid', backup.id,
-                        '--label',
-                        f'openstack-project-id={backup.project_id}',
-                        '--label', f'openstack-user-id={backup.user_id}',
-                        self._get_snap_path(backup.volume_id,
-                                            snapshot,
-                                            include_io_scheme=True),
-                        backup.volume_id],
-                        capture_output=False)))
+                    self.b_backup.backup(version_uid=backup.id,
+                                         base_version_uid=versions[0].uid,
+                                         volume=backup.volume_id,
+                                         snapshot=snapshot,
+                                         source=self._get_snap_path(
+                                             backup.volume_id,
+                                             snapshot,
+                                             include_io_scheme=True),
+
+                                         hints=self.diff_list)
+                    self._add_labels(backup)
                     source_rbd_snap.close()
                     source_rbd.close()
                     return
@@ -246,32 +251,32 @@ class BenjiBackupDriver(driver.BackupDriver):
                                                  None,
                                                  self.iterate_cb,
                                                  whole_object=True)
-                    json_hints = tempfile.NamedTemporaryFile(mode="w+")
-                    json.dump(self.diff_list, json_hints,
-                              separators=(',', ':'))
-                    json_hints.flush()
-                    LOG.debug(subprocess.run([
-                        CONF.benji_cli_path, "backup", "-r",
-                        json_hints.name, "-u", backup.id,
-                        self._get_snap_path(backup.volume_id, snapshot,
-                                            include_io_scheme=True),
-                        '--label', f'openstack-project-id={backup.project_id}',
-                        '--label', f'openstack-user-id={backup.user_id}',
-                        backup.volume_id, '--snapshot', snapshot]))
+                    self.b_backup.backup(version_uid=backup.id,
+                                         volume=backup.volume_id,
+                                         snapshot=snapshot,
+                                         source=self._get_snap_path(
+                                             backup.volume_id,
+                                             snapshot,
+                                             include_io_scheme=True),
+
+                                         hints=self.diff_list)
+                    self._add_labels(backup)
                     LOG.debug("done")
                     source_rbd_snap.close()
                     source_rbd.close()
                     return
 
+    def _add_labels(self, backup):
+        Benji.add_label(version_uid=backup.id,
+                        key='openstack-project-id', value=backup.project_id)
+        Benji.add_label(version_uid=backup.id, key='openstack-user-id',
+                        value=backup.user_id)
+
     def _backup_lvm(self, backup, volume_file):
         source = f'{self.io_scheme}:{volume_file._obj.name}'
-        LOG.debug(subprocess.run([CONF.benji_cli_path, "backup", "-u",
-                                  backup.id, source,
-                                  '--label',
-                                  f'openstack-project-id={backup.project_id}',
-                                  '--label',
-                                  f'openstack-user-id={backup.user_id}',
-                                  backup.volume_id]))
+        self.b_backup.backup(version_uid=backup.id, source=source, snapshot="",
+                             volume=backup.volume_id)
+        self._add_labels(backup)
 
     def backup(self, backup, volume_file, backup_metadata=False):
         """Start a backup of a specified volume.
@@ -300,12 +305,10 @@ class BenjiBackupDriver(driver.BackupDriver):
             else:
                 dev_file = volume_file._obj.name
                 source = f'{CONF.benji_io_scheme_lvm}:{dev_file}'
-            LOG.debug(subprocess.run(
-                      [CONF.benji_cli_path, "backup", "-u", backup.id,
-                       source,
-                       '--label', f'openstack-project-id={backup.project_id}',
-                       '--label', f'openstack-user-id={backup.user_id}',
-                       backup.volume_id]))
+
+            self.b_backup.backup(version_uid=backup.id, source=source,
+                                 snapshot="", volume=backup.volume_id)
+            self._add_labels(backup)
         elif backup['parent_id'] is None:
             if self.io_scheme == CONF.benji_io_scheme_ceph:
                 self._backup_rbd_initial(backup)
@@ -330,29 +333,30 @@ class BenjiBackupDriver(driver.BackupDriver):
         volume has been aborted by changing the backup status.
         """
         backend = self._parse_backend(volume_id)
-        benji_cli_cmd = [CONF.benji_cli_path, "restore", "--force"]
+        force = True
+        sparse = False
         if hasattr(volume_file, 'rbd_image'):
             image_name = volume_file.rbd_image.image.get_name()
             CONF.register_opts(rbd_driver.RBD_OPTS, group=backend[0])
             pool = CONF[backend[0]].rbd_pool
             target = f'{CONF.benji_io_scheme_ceph}:{pool}/{image_name}'
-            benji_cli_cmd.append("--sparse")
+            sparse = True
         else:
             target = f'{CONF.benji_io_scheme_lvm}:{volume_file._obj.name}'
-        benji_cli_cmd.append(backup.id)
-        benji_cli_cmd.append(target)
 
-        LOG.debug(subprocess.run(benji_cli_cmd))
+        LOG.debug(self.b_backup.restore(version_uid=backup.id,
+                                        target=target,
+                                        sparse=sparse,
+                                        force=force))
         return
 
     def delete_backup(self, backup):
         """Delete a saved backup."""
-        LOG.debug(subprocess.run(
-            [
-                CONF.benji_cli_path,
-                "rm",
-                backup.id,
-                "--force"]))
+        try:
+            self.b_backup.rm(VersionUid(backup.id), force=True)
+        except KeyError:
+            LOG.warning("'%(version_uid)s' not found in benji database",
+                        {'version_uid': backup.id})
         return
 
     def export_record(self, backup):

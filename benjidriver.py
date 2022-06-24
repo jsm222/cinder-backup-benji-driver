@@ -22,6 +22,7 @@ import benji.config as benji_config
 from benji.io.factory import IOFactory
 from benji.storage.factory import StorageFactory
 import eventlet
+from os_brick.remotefs import remotefs as remotefs_brick
 from oslo_config import cfg
 from oslo_log import log as logging
 import rados
@@ -29,6 +30,7 @@ import rbd
 
 from cinder.backup import driver
 from cinder import exception
+from cinder import utils
 import cinder.volume.drivers.rbd as rbd_driver
 
 
@@ -48,16 +50,22 @@ def setup_logging():
 
 
 service_opts = [
-    cfg.StrOpt('benji_cli_path', default='/opt/benji/bin/benji',
-               help='Path to benji cli binary (in a venv)'),
+    cfg.StrOpt('benji_storage_name', default=None,
+               help='Name of benji storage from benji.yaml to use'),
+    cfg.StrOpt('benji_nfs_share_path', default=None,
+               help='NFS share in hostname:path, ipv4addr:path, '
+                    'or "[ipv6addr]:path" format.'),
+    cfg.StrOpt('benji_backup_mount_point_base',
+               default='$state_path/benji_backup_mount',
+               help='Base dir containing mount point for NFS share.'),
     cfg.StrOpt('benji_io_scheme_ceph', default='cinder-volumes',
                help='Benji io scheme for ceph sources to backup'),
-    cfg.StrOpt('benji_io_scheme_lvm', default='file',
-               help='Benji io scheme for ceph sources to backup'),
+    cfg.StrOpt('benji_io_scheme_file', default='file',
+               help='Benji io scheme for file sources to backup'),
     cfg.StrOpt('benji_snapshot_prefix', default='benjibackup-',
-               help='Rbd prefix for cinder snaphot id'),
+               help='prefix for rbd snaphots'),
     cfg.StrOpt('benji_premade_snapshot_prefix', default='benjibackup_premade-',
-               help='Rbd prefix for premade cinder snaphot id'),
+               help='prefix for premade rbd snaphots'),
 ]
 CONF = cfg.CONF
 CONF.register_opts(service_opts)
@@ -74,10 +82,59 @@ class BenjiBackupDriver(driver.BackupDriver):
         self.rados = rados
         self.rbd = rbd
         self.diff_list = []
+        if CONF.benji_nfs_share_path is not None:
+            self.nfs_mount_path = self._mount_nfs()
         bconfig = benji_config.Config()
+        if CONF.benji_storage_name is None:
+            self.storage_name = bconfig.get("defaultStorage")
+        else:
+            self.storage_name = CONF.benji_storage_name
+        self.storages = bconfig.get("storages")
         IOFactory.initialize(bconfig)
         StorageFactory.initialize(bconfig)
         self.b_backup = Benji(bconfig)
+        self.ios = bconfig.get("ios")
+
+    def check_for_setup_error(self):
+        rbdmodules = [iomodule for iomodule in self.ios
+                      if iomodule["module"] == "rbd"]
+        config_modules = [iomodule for iomodule in rbdmodules
+                          if iomodule["name"] == CONF.benji_io_scheme_ceph]
+        if rbdmodules and not config_modules:
+            raise exception.BackupDriverException(
+                reason="No ios module rbd named %(name)s in benji.yaml"
+                % {'name': CONF.benji_io_scheme_ceph})
+
+        storage = [storage for storage in self.storages
+                   if storage["name"] == self.storage_name]
+        LOG.debug(storage)
+        if CONF.benji_nfs_share_path is None:
+            return
+        if not storage:
+            raise exception.BackupDriverException(
+                reason="storage name '%(storage_name)s"
+                "' not found in /etc/benji.yaml"
+                % {'storage_name': self.storage_name})
+
+        if storage[0]["configuration"]["path"] != self.nfs_mount_path:
+            raise exception.BackupDriverException(
+                reason="mount point '%(mount_point)s' not found in "
+                "/etc/benji.yaml in "
+                "storage '%(storage_name)s' configuration path"
+                % {'mount_point': self.nfs_mount_path,
+                   'storage_name': self.storage_name})
+
+    def _mount_nfs(self):
+        remotefsclient = remotefs_brick.RemoteFsClient(
+            'nfs',
+            utils.get_root_helper(),
+            nfs_mount_point_base=CONF.benji_backup_mount_point_base,
+            nfs_mount_options="")
+        remotefsclient.mount(CONF.benji_nfs_share_path)
+        nfs_share_path = CONF.benji_nfs_share_path
+        mount_point = remotefsclient.get_mount_point(nfs_share_path)
+        LOG.info("Usinng '%(mount_point)s'", {'mount_point': mount_point})
+        return mount_point
 
     def iterate_cb(self, offset, length, exists):
         self.diff_list.append((offset, length, exists))
@@ -92,7 +149,7 @@ class BenjiBackupDriver(driver.BackupDriver):
                                       ))
         try:
             client.connect()
-            pool_to_open = pool or "cinder-volumes"
+            pool_to_open = pool or self.pool
             ioctx = client.open_ioctx(pool_to_open)
             return client, ioctx
         except rados.Error:
@@ -210,6 +267,7 @@ class BenjiBackupDriver(driver.BackupDriver):
                                          base_version_uid=versions[0].uid,
                                          volume=backup.volume_id,
                                          snapshot=snapshot,
+                                         storage_name=self.storage_name,
                                          source=self._get_snap_path(
                                              backup.volume_id,
                                              snapshot,
@@ -254,6 +312,7 @@ class BenjiBackupDriver(driver.BackupDriver):
                     self.b_backup.backup(version_uid=backup.id,
                                          volume=backup.volume_id,
                                          snapshot=snapshot,
+                                         storage_name=self.storage_name,
                                          source=self._get_snap_path(
                                              backup.volume_id,
                                              snapshot,
@@ -272,9 +331,10 @@ class BenjiBackupDriver(driver.BackupDriver):
         Benji.add_label(version_uid=backup.id, key='openstack-user-id',
                         value=backup.user_id)
 
-    def _backup_lvm(self, backup, volume_file):
+    def _backup_file(self, backup, volume_file):
         source = f'{self.io_scheme}:{volume_file._obj.name}'
         self.b_backup.backup(version_uid=backup.id, source=source, snapshot="",
+                             storage_name=self.storage_name,
                              volume=backup.volume_id)
         self._add_labels(backup)
 
@@ -292,11 +352,12 @@ class BenjiBackupDriver(driver.BackupDriver):
             CONF.register_opts(rbd_driver.RBD_OPTS, group=backend[0])
             LOG.debug(CONF[backend[0]].rbd_pool)
             self.pool = CONF[backend[0]].rbd_pool
+            LOG.debug(self.pool)
             self.ceph_user = CONF[backend[0]].rbd_user
             self.ceph_conf = CONF[backend[0]].rbd_ceph_conf
 
         else:
-            self.io_scheme = CONF.benji_io_scheme_lvm
+            self.io_scheme = CONF.benji_io_scheme_file
 
         if backup["snapshot_id"] is not None:
             if hasattr(volume_file, 'rbd_image'):
@@ -304,21 +365,22 @@ class BenjiBackupDriver(driver.BackupDriver):
                 source = f'{self.io_scheme}:{self.pool}/{ceph_name}'
             else:
                 dev_file = volume_file._obj.name
-                source = f'{CONF.benji_io_scheme_lvm}:{dev_file}'
+                source = f'{CONF.benji_io_scheme_file}:{dev_file}'
 
             self.b_backup.backup(version_uid=backup.id, source=source,
+                                 storage_name=self.storage_name,
                                  snapshot="", volume=backup.volume_id)
             self._add_labels(backup)
         elif backup['parent_id'] is None:
             if self.io_scheme == CONF.benji_io_scheme_ceph:
                 self._backup_rbd_initial(backup)
-            elif self.io_scheme == CONF.benji_io_scheme_lvm:
-                self._backup_lvm(backup, volume_file)
+            elif self.io_scheme == CONF.benji_io_scheme_file:
+                self._backup_file(backup, volume_file)
         elif backup['parent_id'] is not None:
             if self.io_scheme == CONF.benji_io_scheme_ceph:
                 self._backup_rbd_differential(backup)
-            elif self.io_scheme == CONF.benji_io_scheme_lvm:
-                self._backup_lvm(backup, volume_file)
+            elif self.io_scheme == CONF.benji_io_scheme_file:
+                self._backup_file(backup, volume_file)
 
     def restore(self, backup, volume_id, volume_file):
         """Restore a saved backup.
@@ -342,7 +404,7 @@ class BenjiBackupDriver(driver.BackupDriver):
             target = f'{CONF.benji_io_scheme_ceph}:{pool}/{image_name}'
             sparse = True
         else:
-            target = f'{CONF.benji_io_scheme_lvm}:{volume_file._obj.name}'
+            target = f'{CONF.benji_io_scheme_file}:{volume_file._obj.name}'
 
         LOG.debug(self.b_backup.restore(version_uid=backup.id,
                                         target=target,
@@ -390,7 +452,4 @@ class BenjiBackupDriver(driver.BackupDriver):
                             information
         :returns: nothing
         """
-        return
-
-    def check_for_setup_error(self):
         return

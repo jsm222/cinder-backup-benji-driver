@@ -197,21 +197,6 @@ class BenjiBackupDriver(driver.BackupDriver):
     def put_metadata(self, volume_id, json_metadata):
         self.backup_meta_api.put(volume_id, json_metadata)
 
-    def _parse_backend(self, volume_id):
-        # Using DEFAULT section to configure drivers
-        # is not supported since Ocata.
-        if len(CONF.enabled_backends) > 1:
-            src_volume = self.db.volume_get(self.context, volume_id)
-            backend = [b.value
-                       for b in src_volume.volume_type.extra_specs
-                       if b.key == "volume_backend_name"]
-            LOG.debug(src_volume.volume_type.extra_specs)
-            LOG.debug("'%(backend)s'", {'backend': backend})
-
-        else:
-            backend = CONF.enabled_backends
-        return backend
-
     def _backup_rbd_differential(self, backup):
         with eventlet.tpool.Proxy(rbd_driver.RADOSClient(
                 self, self.pool)) as client:
@@ -346,21 +331,20 @@ class BenjiBackupDriver(driver.BackupDriver):
         methods in native threads, so the method implementation doesn't need to
         worry about that..
         """
-        backend = self._parse_backend(backup.volume_id)
         if hasattr(volume_file, 'rbd_image'):
             self.io_scheme = CONF.benji_io_scheme_ceph
-            CONF.register_opts(rbd_driver.RBD_OPTS, group=backend[0])
-            LOG.debug(CONF[backend[0]].rbd_pool)
-            self.pool = CONF[backend[0]].rbd_pool
+            LOG.debug(volume_file.rbd_pool)
+            self.pool = volume_file.rbd_pool
             LOG.debug(self.pool)
-            self.ceph_user = CONF[backend[0]].rbd_user
-            self.ceph_conf = CONF[backend[0]].rbd_ceph_conf
+            self.ceph_user = volume_file.rbd_user
+            self.ceph_conf = volume_file.rbd_conf
 
         else:
             self.io_scheme = CONF.benji_io_scheme_file
 
         if backup["snapshot_id"] is not None:
             if hasattr(volume_file, 'rbd_image'):
+                # volume_file.rbd_img is cloned from the snapshot
                 ceph_name = volume_file.rbd_image.image.get_name()
                 source = f'{self.io_scheme}:{self.pool}/{ceph_name}'
             else:
@@ -394,13 +378,11 @@ class BenjiBackupDriver(driver.BackupDriver):
         May raise BackupRestoreCancel to indicate that the restoration of a
         volume has been aborted by changing the backup status.
         """
-        backend = self._parse_backend(volume_id)
         force = True
         sparse = False
         if hasattr(volume_file, 'rbd_image'):
             image_name = volume_file.rbd_image.image.get_name()
-            CONF.register_opts(rbd_driver.RBD_OPTS, group=backend[0])
-            pool = CONF[backend[0]].rbd_pool
+            pool = volume_file.rbd_pool
             target = f'{CONF.benji_io_scheme_ceph}:{pool}/{image_name}'
             sparse = True
         else:
